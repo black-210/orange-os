@@ -1,0 +1,3 @@
+NAME="KDE Plasma"
+DESCRIPTION="KDE Plasma desktop environment"
+COMMAND="/usr/bin/startplasma-wayland"

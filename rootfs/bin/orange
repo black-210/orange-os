@@ -1,0 +1,589 @@
+#!/bin/sh
+
+VERSION="0.2.0"
+CONFIG="${ORANGE_CONFIG:-/etc/orange.conf}"
+
+if [ -f "$CONFIG" ]; then
+    . "$CONFIG"
+fi
+
+NAME="${NAME:-Orange OS}"
+PLATFORM="${PLATFORM:-xnu++}"
+MODE="${MODE:-cli}"
+
+STATE_ROOT="${STATE_ROOT:-/var/lib/orange}"
+PACKAGE_ROOT="${PACKAGE_ROOT:-$STATE_ROOT/packages}"
+PACKAGE_DB="${PACKAGE_DB:-$STATE_ROOT/packages.db}"
+LOG_ROOT="${LOG_ROOT:-/var/log/orange}"
+
+usage() {
+    cat <<USAGE
+$NAME $VERSION
+
+Usage:
+  orange init
+  orange system
+  orange package <command>
+  orange service <command>
+  orange version
+  orange help
+
+Package commands:
+  orange package list
+  orange package search <name>
+  orange package install <name>
+  orange package remove <name>
+  orange package info <name>
+  orange package update
+
+Service commands:
+  orange service list
+  orange service enable <name>
+  orange service disable <name>
+  orange service start <name>
+  orange service stop <name>
+  orange service status <name>
+USAGE
+}
+
+ensure_state() {
+    mkdir -p "$PACKAGE_ROOT"
+    mkdir -p "$LOG_ROOT"
+
+    if [ ! -f "$PACKAGE_DB" ]; then
+        : > "$PACKAGE_DB"
+    fi
+}
+
+cmd_init() {
+    echo "Initializing $NAME..."
+
+    mkdir -p "$STATE_ROOT"
+    mkdir -p "$PACKAGE_ROOT"
+    mkdir -p "$LOG_ROOT"
+
+    if [ ! -f "$PACKAGE_DB" ]; then
+        : > "$PACKAGE_DB"
+    fi
+
+    echo "Orange OS initialized."
+}
+
+cmd_system() {
+    echo "$NAME"
+    echo "Version: $VERSION"
+    echo "Platform: $PLATFORM"
+    echo "Mode: $MODE"
+    echo "Package database: $PACKAGE_DB"
+}
+
+package_exists() {
+    grep -Fxq "$1" "$PACKAGE_DB" 2>/dev/null
+}
+
+cmd_package() {
+    ensure_state
+
+    cmd_service() {
+    SERVICE_ROOT="${SERVICE_ROOT:-/etc/orange/services}"
+    SERVICE_STATE="${SERVICE_STATE:-/var/lib/orange/services}"
+
+    mkdir -p "$SERVICE_STATE"
+
+    case "$1" in
+        list)
+            echo "Orange OS services:"
+
+            if [ ! -d "$SERVICE_ROOT" ]; then
+                echo "  (none)"
+                return 0
+            fi
+
+            found=0
+            for service in "$SERVICE_ROOT"/*.service; do
+                [ -f "$service" ] || continue
+                name=$(basename "$service" .service)
+                echo "  $name"
+                found=1
+            done
+
+            [ "$found" -eq 0 ] && echo "  (none)"
+            ;;
+
+        enable)
+            [ -z "$2" ] && {
+                echo "error: service name required"
+                return 1
+            }
+
+            if [ ! -f "$SERVICE_ROOT/$2.service" ]; then
+                echo "error: service not found: $2"
+                return 1
+            fi
+
+            touch "$SERVICE_STATE/$2.enabled"
+            echo "Enabled: $2"
+            ;;
+
+        disable)
+            [ -z "$2" ] && {
+                echo "error: service name required"
+                return 1
+            }
+
+            rm -f "$SERVICE_STATE/$2.enabled"
+            echo "Disabled: $2"
+            ;;
+
+        start)
+            [ -z "$2" ] && {
+                echo "error: service name required"
+                return 1
+            }
+
+            if [ ! -f "$SERVICE_ROOT/$2.service" ]; then
+                echo "error: service not found: $2"
+                return 1
+            fi
+
+            . "$SERVICE_ROOT/$2.service"
+
+            if [ -z "$COMMAND" ]; then
+                echo "error: service has no command: $2"
+                return 1
+            fi
+
+            sh -c "$COMMAND" &
+            echo $! > "$SERVICE_STATE/$2.pid"
+
+            echo "Started: $2"
+            ;;
+
+        stop)
+            [ -z "$2" ] && {
+                echo "error: service name required"
+                return 1
+            }
+
+            if [ -f "$SERVICE_STATE/$2.pid" ]; then
+                pid=$(cat "$SERVICE_STATE/$2.pid")
+                kill "$pid" 2>/dev/null || true
+                rm -f "$SERVICE_STATE/$2.pid"
+            fi
+
+            echo "Stopped: $2"
+            ;;
+
+        status)
+            [ -z "$2" ] && {
+                echo "error: service name required"
+                return 1
+            }
+
+            if [ -f "$SERVICE_STATE/$2.pid" ]; then
+                pid=$(cat "$SERVICE_STATE/$2.pid")
+
+                if kill -0 "$pid" 2>/dev/null; then
+                    echo "$2: running (pid $pid)"
+                else
+                    rm -f "$SERVICE_STATE/$2.pid"
+                    echo "$2: stopped"
+                fi
+            else
+                echo "$2: stopped"
+            fi
+            ;;
+
+        *)
+            echo "Unknown service command: $1"
+            return 1
+            ;;
+    esac
+}
+
+case "$1" in
+        list)
+            echo "Installed packages:"
+
+            if [ ! -s "$PACKAGE_DB" ]; then
+                echo "  (none)"
+                return 0
+            fi
+
+            while IFS= read -r package; do
+                [ -n "$package" ] && echo "  $package"
+            done < "$PACKAGE_DB"
+            ;;
+
+        search)
+            if [ -z "$2" ]; then
+                echo "error: package name required"
+                return 1
+            fi
+
+            echo "Searching package: $2"
+
+            if package_exists "$2"; then
+                echo "$2"
+            else
+                echo "No installed package named: $2"
+            fi
+            ;;
+
+        install)
+            if [ -z "$2" ]; then
+                echo "error: package name required"
+                return 1
+            fi
+
+            if package_exists "$2"; then
+                echo "Package already installed: $2"
+                return 0
+            fi
+
+            printf '%s\n' "$2" >> "$PACKAGE_DB"
+            mkdir -p "$PACKAGE_ROOT/$2"
+
+            echo "Installed: $2"
+            ;;
+
+        remove)
+            if [ -z "$2" ]; then
+                echo "error: package name required"
+                return 1
+            fi
+
+            if ! package_exists "$2"; then
+                echo "Package is not installed: $2"
+                return 1
+            fi
+
+            grep -Fxv "$2" "$PACKAGE_DB" > "$PACKAGE_DB.tmp"
+            mv "$PACKAGE_DB.tmp" "$PACKAGE_DB"
+            rm -rf "$PACKAGE_ROOT/$2"
+
+            echo "Removed: $2"
+            ;;
+
+        info)
+            if [ -z "$2" ]; then
+                echo "error: package name required"
+                return 1
+            fi
+
+            if package_exists "$2"; then
+                echo "Package: $2"
+                echo "Status: installed"
+                echo "Root: $PACKAGE_ROOT/$2"
+            else
+                echo "Package: $2"
+                echo "Status: not installed"
+                return 1
+            fi
+            ;;
+
+        update)
+            echo "Orange package database update"
+            echo "No repository configured yet."
+            ;;
+
+        *)
+            echo "Unknown package command: $1"
+            return 1
+            ;;
+    esac
+}
+
+cmd_service() {
+    cmd_service() {
+    SERVICE_ROOT="${SERVICE_ROOT:-/etc/orange/services}"
+    SERVICE_STATE="${SERVICE_STATE:-/var/lib/orange/services}"
+
+    mkdir -p "$SERVICE_STATE"
+
+    case "$1" in
+        list)
+            echo "Orange OS services:"
+
+            if [ ! -d "$SERVICE_ROOT" ]; then
+                echo "  (none)"
+                return 0
+            fi
+
+            found=0
+            for service in "$SERVICE_ROOT"/*.service; do
+                [ -f "$service" ] || continue
+                name=$(basename "$service" .service)
+                echo "  $name"
+                found=1
+            done
+
+            [ "$found" -eq 0 ] && echo "  (none)"
+            ;;
+
+        enable)
+            [ -z "$2" ] && {
+                echo "error: service name required"
+                return 1
+            }
+
+            if [ ! -f "$SERVICE_ROOT/$2.service" ]; then
+                echo "error: service not found: $2"
+                return 1
+            fi
+
+            touch "$SERVICE_STATE/$2.enabled"
+            echo "Enabled: $2"
+            ;;
+
+        disable)
+            [ -z "$2" ] && {
+                echo "error: service name required"
+                return 1
+            }
+
+            rm -f "$SERVICE_STATE/$2.enabled"
+            echo "Disabled: $2"
+            ;;
+
+        start)
+            [ -z "$2" ] && {
+                echo "error: service name required"
+                return 1
+            }
+
+            if [ ! -f "$SERVICE_ROOT/$2.service" ]; then
+                echo "error: service not found: $2"
+                return 1
+            fi
+
+            . "$SERVICE_ROOT/$2.service"
+
+            if [ -z "$COMMAND" ]; then
+                echo "error: service has no command: $2"
+                return 1
+            fi
+
+            sh -c "$COMMAND" &
+            echo $! > "$SERVICE_STATE/$2.pid"
+
+            echo "Started: $2"
+            ;;
+
+        stop)
+            [ -z "$2" ] && {
+                echo "error: service name required"
+                return 1
+            }
+
+            if [ -f "$SERVICE_STATE/$2.pid" ]; then
+                pid=$(cat "$SERVICE_STATE/$2.pid")
+                kill "$pid" 2>/dev/null || true
+                rm -f "$SERVICE_STATE/$2.pid"
+            fi
+
+            echo "Stopped: $2"
+            ;;
+
+        status)
+            [ -z "$2" ] && {
+                echo "error: service name required"
+                return 1
+            }
+
+            if [ -f "$SERVICE_STATE/$2.pid" ]; then
+                pid=$(cat "$SERVICE_STATE/$2.pid")
+
+                if kill -0 "$pid" 2>/dev/null; then
+                    echo "$2: running (pid $pid)"
+                else
+                    rm -f "$SERVICE_STATE/$2.pid"
+                    echo "$2: stopped"
+                fi
+            else
+                echo "$2: stopped"
+            fi
+            ;;
+
+        *)
+            echo "Unknown service command: $1"
+            return 1
+            ;;
+    esac
+}
+
+case "$1" in
+        list)
+            echo "Orange OS services:"
+            echo "  (none configured)"
+            ;;
+
+        start)
+            [ -z "$2" ] && {
+                echo "error: service name required"
+                return 1
+            }
+
+            echo "Starting service: $2"
+            ;;
+
+        stop)
+            [ -z "$2" ] && {
+                echo "error: service name required"
+                return 1
+            }
+
+            echo "Stopping service: $2"
+            ;;
+
+        *)
+            echo "Unknown service command: $1"
+            return 1
+            ;;
+    esac
+}
+
+cmd_service() {
+    SERVICE_ROOT="${SERVICE_ROOT:-/etc/orange/services}"
+    SERVICE_STATE="${SERVICE_STATE:-/var/lib/orange/services}"
+
+    mkdir -p "$SERVICE_STATE"
+
+    case "$1" in
+        list)
+            echo "Orange OS services:"
+
+            if [ ! -d "$SERVICE_ROOT" ]; then
+                echo "  (none)"
+                return 0
+            fi
+
+            found=0
+            for service in "$SERVICE_ROOT"/*.service; do
+                [ -f "$service" ] || continue
+                name=$(basename "$service" .service)
+                echo "  $name"
+                found=1
+            done
+
+            [ "$found" -eq 0 ] && echo "  (none)"
+            ;;
+
+        enable)
+            [ -z "$2" ] && {
+                echo "error: service name required"
+                return 1
+            }
+
+            if [ ! -f "$SERVICE_ROOT/$2.service" ]; then
+                echo "error: service not found: $2"
+                return 1
+            fi
+
+            touch "$SERVICE_STATE/$2.enabled"
+            echo "Enabled: $2"
+            ;;
+
+        disable)
+            [ -z "$2" ] && {
+                echo "error: service name required"
+                return 1
+            }
+
+            rm -f "$SERVICE_STATE/$2.enabled"
+            echo "Disabled: $2"
+            ;;
+
+        start)
+            [ -z "$2" ] && {
+                echo "error: service name required"
+                return 1
+            }
+
+            if [ ! -f "$SERVICE_ROOT/$2.service" ]; then
+                echo "error: service not found: $2"
+                return 1
+            fi
+
+            . "$SERVICE_ROOT/$2.service"
+
+            if [ -z "$COMMAND" ]; then
+                echo "error: service has no command: $2"
+                return 1
+            fi
+
+            sh -c "$COMMAND" &
+            echo $! > "$SERVICE_STATE/$2.pid"
+
+            echo "Started: $2"
+            ;;
+
+        stop)
+            [ -z "$2" ] && {
+                echo "error: service name required"
+                return 1
+            }
+
+            if [ -f "$SERVICE_STATE/$2.pid" ]; then
+                pid=$(cat "$SERVICE_STATE/$2.pid")
+                kill "$pid" 2>/dev/null || true
+                rm -f "$SERVICE_STATE/$2.pid"
+            fi
+
+            echo "Stopped: $2"
+            ;;
+
+        status)
+            [ -z "$2" ] && {
+                echo "error: service name required"
+                return 1
+            }
+
+            if [ -f "$SERVICE_STATE/$2.pid" ]; then
+                pid=$(cat "$SERVICE_STATE/$2.pid")
+
+                if kill -0 "$pid" 2>/dev/null; then
+                    echo "$2: running (pid $pid)"
+                else
+                    rm -f "$SERVICE_STATE/$2.pid"
+                    echo "$2: stopped"
+                fi
+            else
+                echo "$2: stopped"
+            fi
+            ;;
+
+        *)
+            echo "Unknown service command: $1"
+            return 1
+            ;;
+    esac
+}
+
+case "$1" in
+    init)
+        cmd_init
+        ;;
+    system)
+        cmd_system
+        ;;
+    package)
+        shift
+        cmd_package "$@"
+        ;;
+    service)
+        shift
+        cmd_service "$@"
+        ;;
+    version)
+        echo "$NAME $VERSION"
+        ;;
+    help|"")
+        usage
+        ;;
+    *)
+        echo "Unknown command: $1"
+        usage
+        exit 1
+        ;;
+esac
